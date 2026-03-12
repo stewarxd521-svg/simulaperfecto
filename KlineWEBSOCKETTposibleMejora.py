@@ -156,6 +156,10 @@ class KlineWebSocketCache:
         self.stream_mapping: Dict[str, Tuple[str, str]] = {}
         self.subscribed_streams: set = set()
 
+        # Grupos de (symbol, interval) alineados con las conexiones WS
+        # Se construyen en _create_stream_groups() y se usan en el safety refresh por turnos
+        self._refresh_groups: List[List[Tuple[str, str]]] = []
+
     # =========================================================================
     # UTILIDADES
     # =========================================================================
@@ -472,14 +476,21 @@ class KlineWebSocketCache:
             # Buffer vacío → backfill completo
             return (min(1500, self.max_candles), None)
 
-        # Última vela cerrada conocida
-        closed = [r for r in buf if r.get("is_closed", True)]
+        now_ms = int(time.time() * 1000)
+
+        # Última vela "efectivamente cerrada":
+        #   · is_closed=True  → confirmado por WS (campo x=true de Binance)
+        #   · close_time < now → la vela ya expiró aunque el WS nunca envió x=true
+        #     (común en pares ilíquidos donde Binance omite el mensaje final)
+        closed = [
+            r for r in buf
+            if r.get("is_closed", True) or r.get("close_time", now_ms + 1) < now_ms
+        ]
         if not closed:
             return (min(1500, self.max_candles), None)
 
         last_closed_ot      = max(r["open_time"] for r in closed)
         next_expected_ot_ms = last_closed_ot + interval_ms
-        now_ms              = int(time.time() * 1000)
 
         # Aún no ha cerrado la siguiente vela
         if now_ms < next_expected_ot_ms:
@@ -556,24 +567,32 @@ class KlineWebSocketCache:
     # SAFETY REFRESH — red de seguridad global cada 5 min
     # =========================================================================
 
-    async def _periodic_safety_refresh(self, interval_seconds: int = 300) -> None:
+    async def _periodic_safety_refresh(
+        self,
+        interval_seconds: int = 300,
+        inter_group_delay_seconds: int = 60,
+    ) -> None:
         """
-        Red de seguridad que corre cada `interval_seconds` (default: 300 s = 5 min).
+        Red de seguridad que corre cada `interval_seconds` (default: 300 s).
 
         Filosofía:
-          - El WebSocket es la fuente PRIMARIA y construye las velas en tiempo real
-            usando los campos t (open_time), T (close_time) y x (is_closed) que
-            Binance envía en cada mensaje kline.
-          - Este task solo interviene cuando el WS falla silenciosamente:
+          - El WebSocket es la fuente PRIMARIA y construye las velas en tiempo real.
+          - Este task solo actúa cuando el WS falla silenciosamente:
               · Pares ilíquidos donde Binance no emite x=true al cierre.
               · Reconexiones WS que dejaron un hueco.
-              · Cualquier drop de mensajes no detectado.
-          - Para cada par llama a _calc_smart_limit; si devuelve 0 → el buffer
-            ya está al día (el WS hizo su trabajo) → no se hace ningún request.
-          - Concurrencia máxima igual a rest_concurrency para no saturar la API.
+          - Para cada par llama a _calc_smart_limit; si devuelve 0 → WS hizo su trabajo,
+            no se hace ningún request.
+          - TURNOS: los pares se procesan grupo a grupo (alineados con los grupos WS),
+            con `inter_group_delay_seconds` de pausa entre grupos. Así nunca se lanzan
+            N grupos × 40 símbolos a la vez y se evita superar los rate-limits de Binance.
         """
-        print(f"🛡  Safety refresh iniciado — período={interval_seconds}s "
-              f"(el WS construye las velas; esto solo cubre huecos que el WS pierda)")
+        n_groups = len(self._refresh_groups)
+        total    = sum(len(g) for g in self._refresh_groups)
+        print(
+            f"🛡  Safety refresh iniciado — período={interval_seconds}s, "
+            f"{n_groups} grupos ({total} pares), "
+            f"pausa entre grupos={inter_group_delay_seconds}s"
+        )
 
         # Espera inicial: dar tiempo al backfill y al WS de estabilizarse
         await asyncio.sleep(30)
@@ -584,50 +603,74 @@ class KlineWebSocketCache:
                 if not self._running:
                     break
 
-                pairs_list = [
-                    (symbol, interval)
-                    for symbol, intervals in self.pairs.items()
-                    for interval in intervals
-                ]
-
-                # Filtrar solo los pares donde el WS no cubrió todos los cierres
-                needs_refresh = [
-                    (sym, itv)
-                    for sym, itv in pairs_list
-                    if self._calc_smart_limit(sym, itv)[0] > 0
-                ]
-
-                if not needs_refresh:
-                    print(f"🛡  Safety refresh: WS al día — 0/{len(pairs_list)} pares "
-                          f"requieren REST")
+                groups = self._refresh_groups
+                if not groups:
                     continue
 
-                print(f"🛡  Safety refresh: {len(needs_refresh)}/{len(pairs_list)} pares "
-                      f"con velas que el WS no confirmó → descargando via REST…")
+                print(
+                    f"🛡  Safety refresh — {len(groups)} grupos, "
+                    f"{sum(len(g) for g in groups)} pares totales"
+                )
 
-                connector = aiohttp.TCPConnector(limit=self.rest_concurrency * 2)
-                sem       = asyncio.Semaphore(self.rest_concurrency)
-                async with aiohttp.ClientSession(connector=connector) as session:
-                    tasks = [
-                        self._smart_refresh_symbol_interval(session, sem, sym, itv)
-                        for sym, itv in needs_refresh
+                for g_idx, group in enumerate(groups, 1):
+                    if not self._running:
+                        break
+
+                    # Pausa entre grupos (no antes del primero)
+                    if g_idx > 1:
+                        print(
+                            f"⏳ Safety refresh: esperando {inter_group_delay_seconds}s "
+                            f"antes del grupo {g_idx}/{len(groups)}…"
+                        )
+                        await asyncio.sleep(inter_group_delay_seconds)
+                        if not self._running:
+                            break
+
+                    # Filtrar solo los pares donde el WS no cubrió todos los cierres
+                    needs_refresh = [
+                        (sym, itv)
+                        for sym, itv in group
+                        if self._calc_smart_limit(sym, itv)[0] > 0
                     ]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for r in results:
-                        if isinstance(r, Exception):
-                            print(f"❌ Error en safety refresh: {r}")
 
-                # Verificar integridad solo en los pares que se refrescaron
-                if self.integrity_check_enabled:
-                    for sym, itv in needs_refresh:
-                        try:
-                            integrity = self._check_integrity(sym, itv)
-                            if integrity["has_gaps"]:
-                                print(f"⚠️  Gap detectado {sym} {itv}: "
-                                      f"{len(integrity['gaps'])} gaps → reparando…")
-                                self._fix_gaps(sym, itv, integrity)
-                        except Exception as e:
-                            print(f"❌ Error verificando integridad {sym} {itv}: {e}")
+                    if not needs_refresh:
+                        print(
+                            f"🛡  Grupo {g_idx}/{len(groups)}: "
+                            f"WS al día — 0/{len(group)} pares necesitan REST"
+                        )
+                        continue
+
+                    print(
+                        f"🛡  Grupo {g_idx}/{len(groups)}: "
+                        f"{len(needs_refresh)}/{len(group)} pares con velas "
+                        f"que el WS no confirmó → descargando via REST…"
+                    )
+
+                    connector = aiohttp.TCPConnector(limit=self.rest_concurrency * 2)
+                    sem       = asyncio.Semaphore(self.rest_concurrency)
+                    async with aiohttp.ClientSession(connector=connector) as session:
+                        tasks = [
+                            self._smart_refresh_symbol_interval(session, sem, sym, itv)
+                            for sym, itv in needs_refresh
+                        ]
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
+                        for r in results:
+                            if isinstance(r, Exception):
+                                print(f"❌ Error en safety refresh grupo {g_idx}: {r}")
+
+                    # Verificar integridad solo en los pares que se refrescaron
+                    if self.integrity_check_enabled:
+                        for sym, itv in needs_refresh:
+                            try:
+                                integrity = self._check_integrity(sym, itv)
+                                if integrity["has_gaps"]:
+                                    print(
+                                        f"⚠️  Gap detectado {sym} {itv}: "
+                                        f"{len(integrity['gaps'])} gaps → reparando…"
+                                    )
+                                    self._fix_gaps(sym, itv, integrity)
+                            except Exception as e:
+                                print(f"❌ Error verificando integridad {sym} {itv}: {e}")
 
             except asyncio.CancelledError:
                 break
@@ -663,6 +706,13 @@ class KlineWebSocketCache:
         ]
         for idx, g in enumerate(groups, 1):
             print(f"📦 Grupo {idx}: {len(g)} streams")
+
+        # Guardar grupos de (symbol, interval) alineados con los grupos WS.
+        # El safety refresh los consume en orden, uno por turno, con 60 s entre grupos.
+        self._refresh_groups = [
+            [self.stream_mapping[s] for s in group]
+            for group in groups
+        ]
 
         return groups
 
@@ -753,6 +803,15 @@ class KlineWebSocketCache:
                                 if buf and buf[-1]["open_time"] == row["open_time"]:
                                     buf[-1] = row
                                 else:
+                                    # Llega una vela nueva → la anterior DEBE estar cerrada.
+                                    # Si Binance nunca envió x=true (par ilíquido) la cerramos
+                                    # aquí usando close_time como criterio infalible.
+                                    now_ms_check = int(time.time() * 1000)
+                                    if buf and not buf[-1]["is_closed"] and buf[-1].get("close_time", now_ms_check + 1) < now_ms_check:
+                                        prev = dict(buf[-1])
+                                        prev["is_closed"] = True
+                                        buf[-1] = prev
+
                                     if buf and row["open_time"] < buf[-1]["open_time"]:
                                         # Vela desordenada (reconexión) → upsert con sort
                                         self._upsert_rows_into_buffer(key, [row])
@@ -889,9 +948,13 @@ class KlineWebSocketCache:
             )
             self._tasks[("stream", idx)] = task
 
-        # Lanzar safety refresh global (1 tarea, cada 5 min, solo actúa si el WS falló)
+        # Lanzar safety refresh global (por turnos: grupo 1, espera, grupo 2, …)
         safety_task = asyncio.run_coroutine_threadsafe(
-            self._periodic_safety_refresh(interval_seconds=300), loop
+            self._periodic_safety_refresh(
+                interval_seconds=300,
+                inter_group_delay_seconds=60,
+            ),
+            loop,
         )
         self._tasks[("safety_refresh", 0)] = safety_task
 
@@ -907,9 +970,10 @@ class KlineWebSocketCache:
         )
         self._tasks[("conn_monitor", 0)] = conn_monitor_task
 
+        n_groups = len(stream_groups)
         print(f"\n✅ KlineWebSocketCache iniciado")
-        print(f"   • Fuente primaria  : WebSocket (construye velas con t/T/x de Binance)")
-        print(f"   • Safety refresh   : 1 tarea global cada 300s (solo actúa si el WS falla)")
+        print(f"   • Fuente primaria  : WebSocket (t/T/x de Binance + auto-close por close_time)")
+        print(f"   • Safety refresh   : cada 300s, {n_groups} grupos por turnos (60s entre grupos)")
         print(f"   • REST periódico   : solo velas no cubiertas por WS (startTime dinámico)")
         print(f"   • Monitor de salud : cada {self.stream_health_check_seconds}s")
         print(f"   • Integridad       : {'✅' if self.integrity_check_enabled else '❌'}")
