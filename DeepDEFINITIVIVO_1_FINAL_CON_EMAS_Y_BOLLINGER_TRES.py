@@ -2339,7 +2339,7 @@ class HeikinAshiTradingBot:
                 logger.debug(f"Error aplicando inversión por historial para {symbol}: {e}")
             # ---------------------------------------------------------------------------
             
-            self.inversion_posiciones_PROBABLE = False
+            
             
             if signal_type == "LONG" and self.inversion_posiciones_PROBABLE:
                 signal_type = "SHORT"
@@ -4717,4 +4717,5 @@ def main():
         bot.cleanup()
 
 if __name__ == "__main__":
+
     main()
