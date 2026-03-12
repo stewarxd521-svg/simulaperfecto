@@ -430,7 +430,7 @@ class ProfitTargetManager:
             logger.info(f"🎯 Nuevo target: ${self.current_target:.2f}")
 
             # --- LÍNEA AÑADIDA (mínima): si ya hubo 2 ciclos, reiniciamos ---
-            if len(self.target_history) >= 2:
+            if len(self.target_history) >= 1:
                 self.reset_for_new_cycle()
             # -----------------------------------------------------------------
 
@@ -478,9 +478,9 @@ class ProfitTargetManager:
 
                 if realized_gain >= target or realized_gain <= -0.5*target:  # Considerar también pérdida extrema
                     logger.info(f"PTM: Target alcanzado por ganancia realizada: ${realized_gain:.2f} >= ${target:.2f}")
-                    if combined_gain <= -0.5*target:
+                    if realized_gain <= -0.5*target:
                         setattr(self.bot, 'inversion_posiciones_PROBABLE', True)  # Activar inversión por historial de pérdidas")
-                    else:
+                    elif realized_gain >= target:
                         setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Desactivar inversión por historial de pérdidas
                         
                     return True
@@ -501,7 +501,7 @@ class ProfitTargetManager:
                                 logger.info(f"PTM: Target alcanzado por balance combinado (incluye PnL no realizado): ${combined_gain:.2f} >= ${target:.2f}")
                                 if combined_gain <= -0.5*target:
                                     setattr(self.bot, 'inversion_posiciones_PROBABLE', True)  # Activar inversión por historial de pérdidas")
-                                else:
+                                elif combined_gain >= target:
                                     setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Desactivar inversión por historial de pérdidas
                                     
                                 return True
@@ -4717,5 +4717,4 @@ def main():
         bot.cleanup()
 
 if __name__ == "__main__":
-
     main()
