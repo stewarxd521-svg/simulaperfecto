@@ -53,10 +53,11 @@ EMA_PERIOD = 20  # Período de la EMA
 EMA_PERIOD_BTC= 200
 FEE_RATE = 0.0005
 MAX_CONCURRENT_TRADES = 50  # Máximo de operaciones simultáneas
+BB_LOOKBACK_CANDLES = 3   # 2 = más señales, 3 = más filtrado
 
 # 🆕 SISTEMA DE RECUPERACIÓN MEJORADO
-ROI_CRITICAL_LOSS = -8.0  # ROI crítico para activar recuperación (más temprano)
-ROI_CRITICAL_PROFIT = 60.0  # ROI positivo para considerar "recuperado" (más bajo)
+ROI_CRITICAL_LOSS = -1.5  # ROI crítico para activar recuperación (más temprano)
+ROI_CRITICAL_PROFIT = 1.0  # ROI positivo para considerar "recuperado" (más bajo)
 ROI_RECOVERY_TARGET_1 = -3.0  # Primera meta de recuperación
 ROI_RECOVERY_TARGET_2 = -1.0  # Segunda meta (opcional)
 ROI_RECOVERY_TARGET_FINAL = 0.5  # Meta final (break-even + algo)
@@ -479,18 +480,19 @@ class ProfitTargetManager:
                 if realized_gain >= target or realized_gain <= -0.5*target:  # Considerar también pérdida extrema
                     logger.info(f"PTM: Target alcanzado por ganancia realizada: ${realized_gain:.2f} >= ${target:.2f}")
                     if realized_gain <= -0.5*target:
-                        if getattr(self.bot, 'inversion_posiciones_PROBABLE'):
+                       if getattr(self.bot, 'inversion_posiciones_PROBABLE'):
+                                 
                             setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Activar inversión por historial de pérdidas")
-                        else: 
+                       else: 
                             setattr(self.bot, 'inversion_posiciones_PROBABLE', True) 
-
+                            
                     elif realized_gain >= target:
                         if getattr(self.bot, 'inversion_posiciones_PROBABLE'):
+                            
                             setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Activar inversión por historial de pérdidas")
                         else: 
-                            setattr(self.bot, 'inversion_posiciones_PROBABLE', True) 
+                            setattr(self.bot, 'inversion_posiciones_PROBABLE', True)                         
                         
-
                     return True
 
                 # 2) Considerar PnL no realizado -> balance combinado
@@ -509,14 +511,15 @@ class ProfitTargetManager:
                                 logger.info(f"PTM: Target alcanzado por balance combinado (incluye PnL no realizado): ${combined_gain:.2f} >= ${target:.2f}")
                                 if combined_gain <= -0.5*target:
                                     if getattr(self.bot, 'inversion_posiciones_PROBABLE'):
-                                            setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Activar inversión por historial de pérdidas")
-                                    else: 
-                                            setattr(self.bot, 'inversion_posiciones_PROBABLE', True)   # Activar inversión por historial de pérdidas")
+                                        setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Desactivar inversión por historial de pérdidas
+                                    else:
+                                        setattr(self.bot, 'inversion_posiciones_PROBABLE', True)  # Activar inversión por historial de pérdidas
                                 elif combined_gain >= target:
                                     if getattr(self.bot, 'inversion_posiciones_PROBABLE'):
-                                            setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Activar inversión por historial de pérdidas")
-                                    else: 
-                                            setattr(self.bot, 'inversion_posiciones_PROBABLE', True) 
+                                        setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Desactivar inversión por historial de pérdidas
+                                    else:
+                                        setattr(self.bot, 'inversion_posiciones_PROBABLE', True)  # Activar inversión por historial de pérdidas
+                                    
                                 return True
 
                 return False
@@ -2148,11 +2151,71 @@ class HeikinAshiTradingBot:
         df.dropna(inplace=True)
         return df
 
-    def check_long_entry(self, row):
-        return (row['open'] > row['ema_200'] and row['open'] > row['bb_lower'] and row['bb_width'] > 0.02312)
+    def check_long_entry(self, df: pd.DataFrame, idx: int = -2, symbol: str = "BTCUSDT") -> bool:
+        """
+        Señal LONG por breakout real hacia arriba de BB_upper.
+        Condiciones:
+          1. open actual > bb_upper  (rompe la banda superior)
+          2. open actual > ema_200   (a favor de la tendencia)
+          3. bb_width > umbral       (bandas con amplitud mínima)
+          4. Las BB_LOOKBACK_CANDLES velas anteriores estuvieron
+             DENTRO de las bandas  (bb_lower <= open <= bb_upper)
+             → confirma que fue un squeeze antes del breakout
+        """
+        try:
+            symbol = symbol.upper()
+            row = df.iloc[-1]
+            # Condiciones básicas de la vela actual
+            basic = (
+                row['open'] > row['bb_upper'] and   # breakout por arriba
+                row['open'] > row['ema_200'] and     # tendencia alcista
+                row['bb_width'] > 0.02312            # bandas con cuerpo suficiente
+            )
+            if not basic:
+                return False
+            # Verificar que las N velas previas estuvieron dentro de las bandas
+            n = BB_LOOKBACK_CANDLES
+            if abs(idx) + n > len(df):              # no hay suficiente historial
+                return False
+            prev_inside = all(
+                df.iloc[idx - i]['bb_lower'] <= df.iloc[idx - i]['open'] <= df.iloc[idx - i]['bb_upper']
+                for i in range(1, n + 1)
+            )
+            return prev_inside
+        except Exception:
+            return False
 
-    def check_short_entry(self, row):
-        return (row['open'] < row['ema_200'] and row['open'] < row['bb_upper'] and row['bb_width'] > 0.02312)
+    def check_short_entry(self, df: pd.DataFrame, idx: int = -2, symbol: str = "BTCUSDT") -> bool:
+        """
+        Señal SHORT por breakout real hacia abajo de BB_lower.
+        Condiciones:
+          1. open actual < bb_lower  (rompe la banda inferior)
+          2. open actual < ema_200   (a favor de la tendencia bajista)
+          3. bb_width > umbral       (bandas con amplitud mínima)
+          4. Las BB_LOOKBACK_CANDLES velas anteriores estuvieron
+             DENTRO de las bandas  (bb_lower <= open <= bb_upper)
+             → confirma squeeze antes del breakout
+        """
+        try:
+            symbol = symbol.upper()
+            row = df.iloc[-1]
+            basic = (
+                row['open'] < row['bb_lower'] and   # breakout por abajo
+                row['open'] < row['ema_200'] and     # tendencia bajista
+                row['bb_width'] > 0.02312
+            )
+            if not basic:
+                return False
+            n = BB_LOOKBACK_CANDLES
+            if abs(idx) + n > len(df):
+                return False
+            prev_inside = all(
+                df.iloc[idx - i]['bb_lower'] <= df.iloc[idx - i]['open'] <= df.iloc[idx - i]['bb_upper']
+                for i in range(1, n + 1)
+            )
+            return prev_inside
+        except Exception:
+            return False
 
     def check_long_exit(self, row):
         return row['open'] < row['bb_lower']
@@ -2310,21 +2373,21 @@ class HeikinAshiTradingBot:
             last_bar = df.iloc[-2]
             signal_type = None
 
-            if self.inversion_posiciones:
-                if self.check_short_entry(last_bar):
+            # if self.inversion_posiciones:
+            #     if self.check_short_entry(df, -2,symbol):
+            #         signal_type = "LONG"
+            #     elif self.check_long_entry(df, -2,symbol):
+            #         signal_type = "SHORT"
+            #     else:
+            #         return {}
+            # else:
+            if self.check_long_entry(df, -2,symbol): # and last_bar['open'] > last_bar['ema_20'] and last_bar['ema_20'] > last_bar['ema_70'] and last_bar['williams_r'] > -40:
                     signal_type = "LONG"
-                elif self.check_long_entry(last_bar):
+            elif self.check_short_entry(df, -2,symbol): # and last_bar['open'] < last_bar['ema_20'] and last_bar['ema_20'] < last_bar['ema_70'] and last_bar['williams_r'] < -60:
                     signal_type = "SHORT"
-                else:
-                    return {}
             else:
-                if self.check_long_entry(last_bar): # and last_bar['open'] > last_bar['ema_20'] and last_bar['ema_20'] > last_bar['ema_70'] and last_bar['williams_r'] > -40:
-                    signal_type = "LONG"
-                elif self.check_short_entry(last_bar): # and last_bar['open'] < last_bar['ema_20'] and last_bar['ema_20'] < last_bar['ema_70'] and last_bar['williams_r'] < -60:
-                    signal_type = "SHORT"
-                else:
-                    return {}
-
+                    return {}                
+            
             # -------------- Nuevo check: historial de pérdidas por símbolo --------------
             try:
                 if signal_type and self._should_invert_signal_for_symbol(symbol, signal_type):
@@ -2335,19 +2398,19 @@ class HeikinAshiTradingBot:
             except Exception as e:
                 logger.debug(f"Error aplicando inversión por historial para {symbol}: {e}")
             # ---------------------------------------------------------------------------
-
+            
             if signal_type == "LONG" and self.inversion_posiciones_PROBABLE:
                 signal_type = "SHORT"
             elif signal_type == "SHORT" and self.inversion_posiciones_PROBABLE:
                 signal_type = "LONG"
-
+                
             # ---------------------------------------------------------------------------
-
+                
             # Precio actual preferente desde WebSocket/cache
             current_price = self.data_cache.get_current_price(symbol)
             if current_price is None:
                 current_price = float(last_bar['close'])
-
+                
             # TP/SL inicial: simple y coherente con las bandas
             if signal_type == "LONG":
                 # initial_tp = float(last_bar['bb_upper'])
@@ -2359,8 +2422,6 @@ class HeikinAshiTradingBot:
                 # initial_sl = float(last_bar['bb_upper'])
                 initial_tp = current_price/((ROI_CRITICAL_PROFIT/100)+1)
                 initial_sl = current_price/((ROI_CRITICAL_LOSS/100)+1)
-
-            
 
             return {
                 'symbol': symbol,
@@ -2382,7 +2443,8 @@ class HeikinAshiTradingBot:
         except Exception as e:
             logger.debug(f"Error analizando (EMA+BB) para {symbol}: {e}")
             return {}
-
+        
+        
 # ---------------- Helper: decidir si invertir señal por historial ----------------
     def _should_invert_signal_for_symbol(self, symbol: str, signal_type: str,
                                         recent_n: int = LOSS_HISTORY_LEN,
@@ -3183,13 +3245,13 @@ class HeikinAshiTradingBot:
                     
                     return
 
-                if not self.inversion_posiciones:
+                if not self.inversion_posiciones_PROBABLE:
                 # MODO NORMAL: Condiciones de cierre estándar
                     if trade.trade_type == "LONG":
-                        if self.check_long_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (-ROI_CRITICAL_LOSS):
+                        if self.check_long_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (ROI_CRITICAL_PROFIT):
                             
                             # 🆕 VERIFICAR ROI antes de cerrar
-                            if current_roi > (-ROI_CRITICAL_LOSS):
+                            if self.check_long_exit(last_barLOP)  and not self.inversion_posiciones:
                                 logger.info(f"⏸️ Señal de cierre detectada pero ROI muy bajo: {current_roi:.2f}%")
                                 logger.info(f"   Esperando recuperación...")
                                 exit_signal = {
@@ -3199,7 +3261,7 @@ class HeikinAshiTradingBot:
                                     'timestamp': datetime.now()
                                 }
                                 # NO cerrar, continuar esperando
-                            elif current_roi < ROI_CRITICAL_LOSS:
+                            elif current_roi < ROI_CRITICAL_LOSS or current_roi > ROI_CRITICAL_PROFIT:
                                 exit_signal = {
                                     'symbol': symbol,
                                     'exit_price': current_price,
@@ -3208,9 +3270,9 @@ class HeikinAshiTradingBot:
                                 }
                     
                     else:  # SHORT
-                        if self.check_short_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (-ROI_CRITICAL_LOSS):
+                        if self.check_short_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (ROI_CRITICAL_PROFIT):
                             
-                            if current_roi > (-ROI_CRITICAL_LOSS):
+                            if self.check_short_exit(last_barLOP)  and not self.inversion_posiciones:
                                 
                                 logger.info(f"⏸️ Señal de cierre detectada pero ROI muy bajo: {current_roi:.2f}%")
                                 logger.info(f"   Esperando recuperación...")
@@ -3221,7 +3283,7 @@ class HeikinAshiTradingBot:
                                     'timestamp': datetime.now()
                                 }
 
-                            elif current_roi < ROI_CRITICAL_LOSS:
+                            elif current_roi < ROI_CRITICAL_LOSS or current_roi > ROI_CRITICAL_PROFIT:
                                 exit_signal = {
                                     'symbol': symbol,
                                     'exit_price': current_price,
@@ -3231,10 +3293,10 @@ class HeikinAshiTradingBot:
                 
                 else:
                     if trade.trade_type == "SHORT":
-                        if self.check_long_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (-ROI_CRITICAL_LOSS):
+                        if self.check_long_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (ROI_CRITICAL_PROFIT):
                             
                             # 🆕 VERIFICAR ROI antes de cerrar
-                            if current_roi > (-ROI_CRITICAL_LOSS):
+                            if self.check_short_exit(last_barLOP) and self.inversion_posiciones:
                                 logger.info(f"⏸️ Señal de cierre detectada pero ROI muy bajo: {current_roi:.2f}%")
                                 logger.info(f"   Esperando recuperación...")
                                 exit_signal = {
@@ -3245,7 +3307,7 @@ class HeikinAshiTradingBot:
                                 }
                                 
                                 # NO cerrar, continuar esperando
-                            elif current_roi < ROI_CRITICAL_LOSS:
+                            elif current_roi < ROI_CRITICAL_LOSS or current_roi > ROI_CRITICAL_PROFIT:
                                 exit_signal = {
                                     'symbol': symbol,
                                     'exit_price': current_price,
@@ -3254,9 +3316,9 @@ class HeikinAshiTradingBot:
                                 }
                     
                     else:  # LONG
-                        if self.check_short_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS :
+                        if self.check_short_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (ROI_CRITICAL_PROFIT):
                             
-                            if current_roi > (-ROI_CRITICAL_LOSS):
+                            if self.check_long_exit(last_barLOP) and self.inversion_posiciones:
                                 logger.info(f"⏸️ Señal de cierre detectada pero ROI muy bajo: {current_roi:.2f}%")
                                 logger.info(f"   Esperando recuperación...")
                                 exit_signal = {
@@ -3266,7 +3328,7 @@ class HeikinAshiTradingBot:
                                     'timestamp': datetime.now()
                                 }
 
-                            elif current_roi < ROI_CRITICAL_LOSS:
+                            elif current_roi < ROI_CRITICAL_LOSS or current_roi > ROI_CRITICAL_PROFIT:
                                 exit_signal = {
                                     'symbol': symbol,
                                     'exit_price': current_price,
@@ -4734,6 +4796,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
