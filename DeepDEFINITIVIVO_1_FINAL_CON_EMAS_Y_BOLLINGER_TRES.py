@@ -479,10 +479,18 @@ class ProfitTargetManager:
                 if realized_gain >= target or realized_gain <= -0.5*target:  # Considerar también pérdida extrema
                     logger.info(f"PTM: Target alcanzado por ganancia realizada: ${realized_gain:.2f} >= ${target:.2f}")
                     if realized_gain <= -0.5*target:
-                        setattr(self.bot, 'inversion_posiciones_PROBABLE', True)  # Activar inversión por historial de pérdidas")
+                        if getattr(self.bot, 'inversion_posiciones_PROBABLE')
+                            setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Activar inversión por historial de pérdidas")
+                        else: 
+                            setattr(self.bot, 'inversion_posiciones_PROBABLE', True) 
+
                     elif realized_gain >= target:
-                        setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Desactivar inversión por historial de pérdidas
+                        if getattr(self.bot, 'inversion_posiciones_PROBABLE')
+                            setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Activar inversión por historial de pérdidas")
+                        else: 
+                            setattr(self.bot, 'inversion_posiciones_PROBABLE', True) 
                         
+
                     return True
 
                 # 2) Considerar PnL no realizado -> balance combinado
@@ -1605,7 +1613,7 @@ class HeikinAshiTradingBot:
 
 
                 # 🎯 NUEVO: Sistema de Profit Targets
-        self.profit_target_manager = ProfitTargetManager(base_amount=4, wait_hours=0.1, bot=self, consider_unrealized=True, use_net_estimate=True)
+        self.profit_target_manager = ProfitTargetManager(base_amount=2, wait_hours=0.1, bot=self, consider_unrealized=True, use_net_estimate=True)
         self.in_cooldown = False
         self.cooldown_until = None
         self.cooldown_lock = threading.Lock()
@@ -2338,9 +2346,7 @@ class HeikinAshiTradingBot:
             except Exception as e:
                 logger.debug(f"Error aplicando inversión por historial para {symbol}: {e}")
             # ---------------------------------------------------------------------------
-            
-            
-            
+
             if signal_type == "LONG" and self.inversion_posiciones_PROBABLE:
                 signal_type = "SHORT"
             elif signal_type == "SHORT" and self.inversion_posiciones_PROBABLE:
@@ -4718,4 +4724,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
