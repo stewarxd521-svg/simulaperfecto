@@ -430,8 +430,8 @@ class ProfitTargetManager:
             logger.info(f"🎯 Nuevo target: ${self.current_target:.2f}")
 
             # --- LÍNEA AÑADIDA (mínima): si ya hubo 2 ciclos, reiniciamos ---
-            if len(self.target_history) >= 1:
-                self.reset_for_new_cycle()
+            #if len(self.target_history) >= 1:
+                #self.reset_for_new_cycle()
             # -----------------------------------------------------------------
 
     def reset_for_new_cycle(self):
@@ -4718,3 +4718,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
