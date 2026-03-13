@@ -2319,6 +2319,25 @@ class HeikinAshiTradingBot:
                     signal_type = "SHORT"
                 else:
                     return {}
+
+            # -------------- Nuevo check: historial de pérdidas por símbolo --------------
+            try:
+                if signal_type and self._should_invert_signal_for_symbol(symbol, signal_type):
+                    # invertir señal
+                    original_signal = signal_type
+                    signal_type = "LONG" if signal_type == "SHORT" else "SHORT"
+                    logger.warning(f"🔄 Señal invertida para {symbol}: {original_signal} -> {signal_type} (por historial de pérdidas)")
+            except Exception as e:
+                logger.debug(f"Error aplicando inversión por historial para {symbol}: {e}")
+            # ---------------------------------------------------------------------------
+
+            if signal_type == "LONG" and self.inversion_posiciones_PROBABLE:
+                signal_type = "SHORT"
+            elif signal_type == "SHORT" and self.inversion_posiciones_PROBABLE:
+                signal_type = "LONG"
+
+            # ---------------------------------------------------------------------------
+
             # Precio actual preferente desde WebSocket/cache
             current_price = self.data_cache.get_current_price(symbol)
             if current_price is None:
@@ -2336,21 +2355,7 @@ class HeikinAshiTradingBot:
                 initial_tp = current_price/((ROI_CRITICAL_PROFIT/100)+1)
                 initial_sl = current_price/((ROI_CRITICAL_LOSS/100)+1)
 
-            # -------------- Nuevo check: historial de pérdidas por símbolo --------------
-            try:
-                if signal_type and self._should_invert_signal_for_symbol(symbol, signal_type):
-                    # invertir señal
-                    original_signal = signal_type
-                    signal_type = "LONG" if signal_type == "SHORT" else "SHORT"
-                    logger.warning(f"🔄 Señal invertida para {symbol}: {original_signal} -> {signal_type} (por historial de pérdidas)")
-            except Exception as e:
-                logger.debug(f"Error aplicando inversión por historial para {symbol}: {e}")
-            # ---------------------------------------------------------------------------
-
-            if signal_type == "LONG" and self.inversion_posiciones_PROBABLE:
-                signal_type = "SHORT"
-            elif signal_type == "SHORT" and self.inversion_posiciones_PROBABLE:
-                signal_type = "LONG"
+            
 
             return {
                 'symbol': symbol,
@@ -4724,4 +4729,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
