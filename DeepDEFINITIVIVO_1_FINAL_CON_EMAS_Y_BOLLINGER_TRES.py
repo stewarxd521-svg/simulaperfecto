@@ -508,10 +508,15 @@ class ProfitTargetManager:
                             if combined_gain >= target or combined_gain <= -0.5*target:  # Considerar también pérdida extrema
                                 logger.info(f"PTM: Target alcanzado por balance combinado (incluye PnL no realizado): ${combined_gain:.2f} >= ${target:.2f}")
                                 if combined_gain <= -0.5*target:
-                                    setattr(self.bot, 'inversion_posiciones_PROBABLE', True)  # Activar inversión por historial de pérdidas")
+                                    if getattr(self.bot, 'inversion_posiciones_PROBABLE'):
+                                            setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Activar inversión por historial de pérdidas")
+                                    else: 
+                                            setattr(self.bot, 'inversion_posiciones_PROBABLE', True)   # Activar inversión por historial de pérdidas")
                                 elif combined_gain >= target:
-                                    setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Desactivar inversión por historial de pérdidas
-                                    
+                                    if getattr(self.bot, 'inversion_posiciones_PROBABLE'):
+                                            setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Activar inversión por historial de pérdidas")
+                                    else: 
+                                            setattr(self.bot, 'inversion_posiciones_PROBABLE', True) 
                                 return True
 
                 return False
@@ -4729,5 +4734,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
