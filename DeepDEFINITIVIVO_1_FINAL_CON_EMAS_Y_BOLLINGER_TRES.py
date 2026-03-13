@@ -479,13 +479,13 @@ class ProfitTargetManager:
                 if realized_gain >= target or realized_gain <= -0.5*target:  # Considerar también pérdida extrema
                     logger.info(f"PTM: Target alcanzado por ganancia realizada: ${realized_gain:.2f} >= ${target:.2f}")
                     if realized_gain <= -0.5*target:
-                        if getattr(self.bot, 'inversion_posiciones_PROBABLE')
+                        if getattr(self.bot, 'inversion_posiciones_PROBABLE'):
                             setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Activar inversión por historial de pérdidas")
                         else: 
                             setattr(self.bot, 'inversion_posiciones_PROBABLE', True) 
 
                     elif realized_gain >= target:
-                        if getattr(self.bot, 'inversion_posiciones_PROBABLE')
+                        if getattr(self.bot, 'inversion_posiciones_PROBABLE'):
                             setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Activar inversión por historial de pérdidas")
                         else: 
                             setattr(self.bot, 'inversion_posiciones_PROBABLE', True) 
@@ -4724,3 +4724,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
