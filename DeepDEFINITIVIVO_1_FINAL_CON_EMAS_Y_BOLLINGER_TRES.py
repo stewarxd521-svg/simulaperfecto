@@ -403,6 +403,10 @@ class ProfitTargetManager:
         self.consider_unrealized = bool(consider_unrealized)
         self.use_net_estimate = bool(use_net_estimate)
 
+        # 🆕 RECOVERY MODE: recuperar pérdidas críticas (RECOVERY_TRIGGER) via PnL no realizado
+        self._pending_recovery_loss: float = 0.0   # USD negativo acumulado de trades RECOVERY_TRIGGER
+        self._recovery_mode: bool = False            # True = esperando recuperar antes de cualquier otra lógica
+
     def attach_bot(self, bot_instance):
         """Permite adjuntar el bot después de crear el manager (si hace falta)."""
         with self.lock:
@@ -450,46 +454,153 @@ class ProfitTargetManager:
             logger.debug(f"Error obteniendo PnL no realizado: {e}")
             return None
 
+    def register_critical_loss(self, loss_usd: float):
+        """
+        🆕 Registra una pérdida crítica originada por RECOVERY_TRIGGER.
+
+        Activa el modo recuperación: is_target_reached() bloqueará la lógica
+        normal y solo retornará True cuando el PnL NO REALIZADO de las
+        posiciones abiertas iguale o supere el monto perdido.
+
+        Args:
+            loss_usd: resultado neto del trade cerrado (debe ser negativo).
+        """
+        with self.lock:
+            if loss_usd >= 0:
+                return  # solo registramos pérdidas reales
+            self._pending_recovery_loss += loss_usd   # acumula (se vuelve más negativo)
+            self._recovery_mode = True
+            logger.warning(
+                f"🔴 [PTM] RECOVERY_TRIGGER registrado | "
+                f"Pérdida este trade: ${loss_usd:.4f} | "
+                f"Total a recuperar: ${abs(self._pending_recovery_loss):.4f}"
+            )
+
+    def _get_unrealized_gross(self) -> Optional[float]:
+        """
+        🆕 Retorna únicamente el PnL bruto no realizado total (float) o None.
+        Usa use_net_estimate para elegir la variante.
+        """
+        summary = self._get_unrealized_summary()
+        if not summary:
+            return None
+        if self.use_net_estimate:
+            val = summary.get('total_unrealized_net_est', summary.get('total_unrealized_gross'))
+        else:
+            val = summary.get('total_unrealized_gross')
+        try:
+            return float(val) if val is not None else None
+        except (TypeError, ValueError):
+            return None
+
     def is_target_reached(self) -> bool:
         """
-        Evalúa si se alcanzó el target. Dos checks:
-         1) Ganancia realizada (balance - daily_start_balance) >= target
-         2) (Opcional) Balance combinado (balance + unrealized_pnl) >= (daily_start_balance + target)
+        Evalúa si se debe cerrar todo.
+
+        PRIORIDAD 1 – MODO RECUPERACIÓN (RECOVERY_TRIGGER):
+            Si hubo una pérdida crítica registrada via register_critical_loss(),
+            solo retorna True cuando el PnL NO REALIZADO de las posiciones abiertas
+            iguale o supere el monto perdido.  Mientras no se cumpla, retorna False
+            sin evaluar ninguna otra condición.
+
+        PRIORIDAD 2 – TARGET NORMAL:
+            1) Ganancia realizada (balance - daily_start_balance) >= target
+            2) (Opcional) Balance combinado (balance + unrealized_pnl) >= target
         """
         with self.lock:
             try:
                 if not self.bot:
-                    logger.debug("ProfitTargetManager: bot no adjuntado, usando solo current_target check por balance.")
+                    logger.debug("ProfitTargetManager: bot no adjuntado.")
                     return False
 
-                # 1) Ganancia realizada
+                # ============================================================
+                # 🆕 PRIORIDAD 1: RECOVERY MODE
+                # Cuando hay una pérdida crítica pendiente, IGNORAR la lógica
+                # de target normal y esperar a que el PnL no realizado la cubra.
+                # ============================================================
+                if self._recovery_mode and self._pending_recovery_loss < 0:
+                    loss_to_recover = abs(self._pending_recovery_loss)
+                    unrealized = self._get_unrealized_gross()
+
+                    if unrealized is None:
+                        # No se puede calcular todavía → esperar
+                        logger.debug(f"[PTM RECOVERY] Sin datos de PnL no realizado, esperando...")
+                        return False
+
+                    logger.info(
+                        f"🔴 [PTM RECOVERY] Pérdida a recuperar: ${loss_to_recover:.4f} | "
+                        f"PnL no realizado: ${unrealized:.4f}"
+                    )
+
+                    if unrealized >= loss_to_recover:
+                        # ✅ El PnL no realizado ya cubre la pérdida → CERRAR TODO
+                        logger.info(
+                            f"✅ [PTM RECOVERY] CONDICIÓN CUMPLIDA → "
+                            f"PnL no realizado ${unrealized:.4f} >= pérdida ${loss_to_recover:.4f} | "
+                            f"Señalizando cierre de todas las posiciones."
+                        )
+                        # Limpiar estado de recuperación para el próximo ciclo
+                        self._pending_recovery_loss = 0.0
+                        self._recovery_mode = False
+                        return True
+                    else:
+                        # ⏳ Todavía no alcanza → seguir esperando
+                        logger.info(
+                            f"⏳ [PTM RECOVERY] Necesito ${loss_to_recover:.4f}, "
+                            f"tengo ${unrealized:.4f} → ESPERANDO"
+                        )
+                        return False
+
+                # ============================================================
+                # PRIORIDAD 2: LÓGICA NORMAL DE TARGET
+                # ============================================================
                 balance = float(getattr(self.bot, 'balance', 0.0))
                 daily_start = float(getattr(self.bot, 'daily_start_balance', 0.0))
                 realized_gain = balance - daily_start
                 target = float(self.current_target)
 
-                # Log de diagnóstico (muy útil al debuguear)
-                logger.debug(f"PTM: balance={balance:.2f}, daily_start={daily_start:.2f}, realized_gain={realized_gain:.2f}, target={target:.2f}")
+                logger.debug(
+                    f"PTM: balance={balance:.2f}, daily_start={daily_start:.2f}, "
+                    f"realized_gain={realized_gain:.2f}, target={target:.2f}"
+                )
 
-                if realized_gain >= target or realized_gain <= -0.5*target:  # Considerar también pérdida extrema
-                    logger.info(f"PTM: Target alcanzado por ganancia realizada: ${realized_gain:.2f} >= ${target:.2f}")
+                # 1) Ganancia / pérdida realizada
+                if realized_gain >= target or realized_gain <= -0.5 * target:
+                    logger.info(
+                        f"PTM: Target alcanzado por ganancia realizada: "
+                        f"${realized_gain:.2f} >= ${target:.2f}"
+                    )
                     return True
 
-                # 2) Considerar PnL no realizado -> balance combinado
+                # 2) Balance combinado (incluye PnL no realizado)
                 if self.consider_unrealized:
                     summary = self._get_unrealized_summary()
                     if summary:
                         if self.use_net_estimate:
-                            combined = float(summary.get('combined_balance_net_est', summary.get('combined_balance_gross', None)))
+                            combined = summary.get(
+                                'combined_balance_net_est',
+                                summary.get('combined_balance_gross')
+                            )
                         else:
-                            combined = float(summary.get('combined_balance_gross', None))
+                            combined = summary.get('combined_balance_gross')
 
                         if combined is not None:
-                            combined_gain = combined - daily_start
-                            logger.debug(f"PTM: combined_balance={combined:.2f}, combined_gain={combined_gain:.2f}")
-                            if combined_gain >= target or combined_gain <= -0.5*target:  # Considerar también pérdida extrema
-                                logger.info(f"PTM: Target alcanzado por balance combinado (incluye PnL no realizado): ${combined_gain:.2f} >= ${target:.2f}")
-                                return True
+                            try:
+                                combined = float(combined)
+                                combined_gain = combined - daily_start
+                                logger.debug(
+                                    f"PTM: combined_balance={combined:.2f}, "
+                                    f"combined_gain={combined_gain:.2f}"
+                                )
+                                if combined_gain >= target or combined_gain <= -0.5 * target:
+                                    logger.info(
+                                        f"PTM: Target alcanzado por balance combinado "
+                                        f"(incluye PnL no realizado): "
+                                        f"${combined_gain:.2f} >= ${target:.2f}"
+                                    )
+                                    return True
+                            except (TypeError, ValueError):
+                                pass
 
                 return False
 
@@ -1422,6 +1533,21 @@ class OrderExecutor:
 
             logger.info("💸 Entry fee: %.6f | Exit fee: %.6f | Total fees: %.6f", entry_fee, exit_fee, total_fees)
             logger.info("💰 RESULTADO NETO: %.6f", result)
+
+            # 🆕 HOOK RECOVERY_TRIGGER → notificar al ProfitTargetManager
+            # Si este cierre fue forzado por ROI crítico, registrar la pérdida para
+            # que is_target_reached() espere a recuperarla via PnL no realizado.
+            if 'RECOVERY_TRIGGER' in reason and result < 0:
+                try:
+                    ptm = getattr(self.bot, 'profit_target_manager', None)
+                    if ptm is not None and hasattr(ptm, 'register_critical_loss'):
+                        ptm.register_critical_loss(result)
+                        logger.info(
+                            "🔴 [_record_closed] Pérdida crítica (%.4f) reportada al ProfitTargetManager. "
+                            "Recovery mode ACTIVADO.", result
+                        )
+                except Exception:
+                    logger.debug("No se pudo registrar pérdida crítica en ProfitTargetManager (ignorado)")
 
             # Actualizar balance del bot (si tu bot maneja concurrencia, añade lock en bot)
             balance_before = getattr(self.bot, 'balance', 0.0)
