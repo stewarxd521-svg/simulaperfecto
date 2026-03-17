@@ -53,10 +53,13 @@ EMA_PERIOD = 20  # Período de la EMA
 EMA_PERIOD_BTC= 200
 FEE_RATE = 0.0005
 MAX_CONCURRENT_TRADES = 50  # Máximo de operaciones simultáneas
+BB_LOOKBACK_CANDLES = 0   # 2 = más señales, 3 = más filtrado
+MOMENTUM_EXIT_ENABLED  = True
+MOMENTUM_EXIT_ROI_MAX  = -0.5    # Solo actúa si ROI < -0.5%
 
 # 🆕 SISTEMA DE RECUPERACIÓN MEJORADO
-ROI_CRITICAL_LOSS = -8.0  # ROI crítico para activar recuperación (más temprano)
-ROI_CRITICAL_PROFIT = 60.0  # ROI positivo para considerar "recuperado" (más bajo)
+ROI_CRITICAL_LOSS = -2.5  # ROI crítico para activar recuperación (más temprano)
+ROI_CRITICAL_PROFIT = 18.0  # ROI positivo para considerar "recuperado" (más bajo)
 ROI_RECOVERY_TARGET_1 = -3.0  # Primera meta de recuperación
 ROI_RECOVERY_TARGET_2 = -1.0  # Segunda meta (opcional)
 ROI_RECOVERY_TARGET_FINAL = 0.5  # Meta final (break-even + algo)
@@ -91,6 +94,20 @@ SYMBOL_INVERT_TTL_SECONDS = 1800  # (opcional) tiempo que mantenemos la inversi�
 PYRAMIDING_CLOSE_ON_ROI_ENABLED = True   # True = cerrar automáticamente trades con pyramiding cuando alcanzan el ROI
 PYRAMIDING_CLOSE_ROI = -0.0               # Umbral por defecto en % (ajústalo a lo que quieras)
 # ------------------------------------------------------------------
+
+# ==================== PYRAMIDING INVERSO (NEGATIVOS) ====================
+INVERSE_PYRAMIDING_ENABLED = True            # activar pyramiding inverso
+INVERSE_PYRAMIDING_NEG_ROI_LEVELS = [-3.0, -5.0, -7.0, -10.0, -12.0]  # niveles negativos (en %)
+INVERSE_PYRAMIDING_MAX_ADDS = 1              # máximo de pyramidings efectivamente permitidos por trade (tu requisito)
+INVERSE_PYRAMIDING_ABORT_LEVEL = 5           # si llega a este número (niveles totales), aceptar pérdida y cerrar
+INVERSE_PYRAMIDING_MULTIPLIER = 1.0          # multiplicador de tamaño para cada add (puedes ajustar)
+INVERSE_PYRAMIDING_MINIMUM_ROI_TO_TRIGGER = -0.5  # no disparar para micro-pérdidas (ejemplo)
+
+# ---- Nuevas opciones para acelerar Adds a partir de un nivel ----
+# A partir de este nivel (4 = el 4º add) empezamos a "acelerar" la cantidad.
+INVERSE_PYRAMIDING_ACCELERATION_START_LEVEL = 4     # nivel desde el que aplicamos el x3
+INVERSE_PYRAMIDING_ACCELERATION_MULTIPLIER = 3.0    # multiplicador base (x3)
+INVERSE_PYRAMIDING_ACCELERATION_MAX_MULT = 10.0     # tope absoluto del multiplicador para seguridad
 
 
 # ==================== PARÁMETROS DEL EXECUTOR DE ÓRDENES ====================
@@ -192,98 +209,58 @@ def add_heikin_ashi_indicators(ha_df: pd.DataFrame, ema_period: int = EMA_PERIOD
     
     return df
 
-    def calculate_williams_r(df: pd.DataFrame, period: int = 300) -> pd.Series:
+def calculate_momentum(series: pd.Series, period: int = 14) -> pd.Series:
         """
-        Williams %R = (Highest High - Close) / (Highest High - Lowest Low) * -100
-        Rango: -100 (sobreventa) a 0 (sobrecompra)
+        Momentum clásico: diferencia entre el precio actual y el precio n periodos atrás.
+        M = Close(t) - Close(t - n)
+        
+        También puedes usar la versión normalizada (Rate of Change):
+        ROC = (Close(t) - Close(t-n)) / Close(t-n) * 100
         """
-        highest_high = df['high'].rolling(window=period, min_periods=period).max()
-        lowest_low   = df['low'].rolling(window=period, min_periods=period).min()
-        wr = ((highest_high - df['close']) / (highest_high - lowest_low)) * -100
-        return wr
+        try:
+            return series.diff(period)          # versión absoluta
+            # return series.pct_change(period) * 100  # versión ROC (%) — descomenta si prefieres
+        except Exception as e:
+            logger.debug(f"Error en calculate_momentum: {e}")
+            return pd.Series(dtype=float)
 
-    def calculate_williams_r(df: pd.DataFrame, period: int = 300) -> pd.Series:
-        """
-        Williams %R = (Highest High - Close) / (Highest High - Lowest Low) * -100
-        Rango: -100 (sobreventa) a 0 (sobrecompra)
-        """
-        highest_high = df['high'].rolling(window=period, min_periods=period).max()
-        lowest_low   = df['low'].rolling(window=period, min_periods=period).min()
-        wr = ((highest_high - df['close']) / (highest_high - lowest_low)) * -100
-        return wr
+def check_bearish_momentum(self, current_bar: pd.Series, prev_bar: pd.Series) -> bool:
+    """
+    BEARISH: momentum cruzó de positivo → negativo
+    M = Close(t) - Close(t-n)
+    """
+    try:
+        mom_now  = current_bar.get('momentum', None)
+        mom_prev = prev_bar.get('momentum', None)
 
-    def calculate_williams_r(df: pd.DataFrame, period: int = 300) -> pd.Series:
-        """
-        Williams %R = (Highest High - Close) / (Highest High - Lowest Low) * -100
-        Rango: -100 (sobreventa) a 0 (sobrecompra)
-        """
-        highest_high = df['high'].rolling(window=period, min_periods=period).max()
-        lowest_low   = df['low'].rolling(window=period, min_periods=period).min()
-        wr = ((highest_high - df['close']) / (highest_high - lowest_low)) * -100
-        return wr
+        if mom_now is None or mom_prev is None:
+            return False
 
+        return (mom_prev > 0) and (mom_now < 0)   # cruce por cero hacia abajo
 
-    def calculate_williams_r(df: pd.DataFrame, period: int = 300) -> pd.Series:
-        """
-        Williams %R = (Highest High - Close) / (Highest High - Lowest Low) * -100
-        Rango: -100 (sobreventa) a 0 (sobrecompra)
-        """
-        highest_high = df['high'].rolling(window=period, min_periods=period).max()
-        lowest_low   = df['low'].rolling(window=period, min_periods=period).min()
-        wr = ((highest_high - df['close']) / (highest_high - lowest_low)) * -100
-        return wr
+    except Exception as e:
+        logger.debug(f"Error en check_bearish_momentum: {e}")
+        return False
 
-    def calculate_williams_r(df: pd.DataFrame, period: int = 300) -> pd.Series:
-        """
-        Williams %R = (Highest High - Close) / (Highest High - Lowest Low) * -100
-        Rango: -100 (sobreventa) a 0 (sobrecompra)
-        """
-        highest_high = df['high'].rolling(window=period, min_periods=period).max()
-        lowest_low   = df['low'].rolling(window=period, min_periods=period).min()
-        wr = ((highest_high - df['close']) / (highest_high - lowest_low)) * -100
-        return wr
+def check_bullish_momentum(self, current_bar: pd.Series, prev_bar: pd.Series) -> bool:
+    """
+    BULLISH: momentum cruzó de negativo → positivo
+    M = Close(t) - Close(t-n)
+    """
+    try:
+        mom_now  = current_bar.get('momentum', None)
+        mom_prev = prev_bar.get('momentum', None)
 
-    def calculate_williams_r(df: pd.DataFrame, period: int = 300) -> pd.Series:
-        """
-        Williams %R = (Highest High - Close) / (Highest High - Lowest Low) * -100
-        Rango: -100 (sobreventa) a 0 (sobrecompra)
-        """
-        highest_high = df['high'].rolling(window=period, min_periods=period).max()
-        lowest_low   = df['low'].rolling(window=period, min_periods=period).min()
-        wr = ((highest_high - df['close']) / (highest_high - lowest_low)) * -100
-        return wr
+        if mom_now is None or mom_prev is None:
+            return False
 
-    def calculate_williams_r(df: pd.DataFrame, period: int = 300) -> pd.Series:
-        """
-        Williams %R = (Highest High - Close) / (Highest High - Lowest Low) * -100
-        Rango: -100 (sobreventa) a 0 (sobrecompra)
-        """
-        highest_high = df['high'].rolling(window=period, min_periods=period).max()
-        lowest_low   = df['low'].rolling(window=period, min_periods=period).min()
-        wr = ((highest_high - df['close']) / (highest_high - lowest_low)) * -100
-        return wr
+        return (mom_prev < 0) and (mom_now > 0)   # cruce por cero hacia arriba
 
-    def calculate_williams_r(df: pd.DataFrame, period: int = 300) -> pd.Series:
-        """
-        Williams %R = (Highest High - Close) / (Highest High - Lowest Low) * -100
-        Rango: -100 (sobreventa) a 0 (sobrecompra)
-        """
-        highest_high = df['high'].rolling(window=period, min_periods=period).max()
-        lowest_low   = df['low'].rolling(window=period, min_periods=period).min()
-        wr = ((highest_high - df['close']) / (highest_high - lowest_low)) * -100
-        return wr
-
-    def calculate_williams_r(df: pd.DataFrame, period: int = 300) -> pd.Series:
-        """
-        Williams %R = (Highest High - Close) / (Highest High - Lowest Low) * -100
-        Rango: -100 (sobreventa) a 0 (sobrecompra)
-        """
-        highest_high = df['high'].rolling(window=period, min_periods=period).max()
-        lowest_low   = df['low'].rolling(window=period, min_periods=period).min()
-        wr = ((highest_high - df['close']) / (highest_high - lowest_low)) * -100
-        return wr
-
-
+    except Exception as e:
+        logger.debug(f"Error en check_bullish_momentum: {e}")
+        return False
+    
+    
 # ==================== GESTOR DE ESTADO ====================
 
 class TradeState(Enum):
@@ -403,10 +380,6 @@ class ProfitTargetManager:
         self.consider_unrealized = bool(consider_unrealized)
         self.use_net_estimate = bool(use_net_estimate)
 
-        # 🆕 RECOVERY MODE: recuperar pérdidas críticas (RECOVERY_TRIGGER) via PnL no realizado
-        self._pending_recovery_loss: float = 0.0   # USD negativo acumulado de trades RECOVERY_TRIGGER
-        self._recovery_mode: bool = False            # True = esperando recuperar antes de cualquier otra lógica
-
     def attach_bot(self, bot_instance):
         """Permite adjuntar el bot después de crear el manager (si hace falta)."""
         with self.lock:
@@ -425,12 +398,17 @@ class ProfitTargetManager:
                 'timestamp': datetime.now()
             })
             self.current_target  = self.base_amount # QUITE UN + ESTE ES EL ORIGNAL += 
+            if getattr(self.bot, 'inversion_posiciones_PROBABLE'):  #  inversión por historial de pérdidas")
+                self.current_target *= 1.5  # Disminuir el target un 50% más si hay inversión por historial de pérdidas
+            else:
+                self.current_target *= 1.0  # Mantener el target base si no hay inversión por historial de pérdidas
+                                    
             logger.info(f"✅ Target alcanzado: ${self.current_target - self.base_amount:.2f}")
             logger.info(f"🎯 Nuevo target: ${self.current_target:.2f}")
 
             # --- LÍNEA AÑADIDA (mínima): si ya hubo 2 ciclos, reiniciamos ---
-            if len(self.target_history) >= 2:
-                self.reset_for_new_cycle()
+            #if len(self.target_history) >= 1:
+                #self.reset_for_new_cycle()
             # -----------------------------------------------------------------
 
     def reset_for_new_cycle(self):
@@ -454,153 +432,65 @@ class ProfitTargetManager:
             logger.debug(f"Error obteniendo PnL no realizado: {e}")
             return None
 
-    def register_critical_loss(self, loss_usd: float):
-        """
-        🆕 Registra una pérdida crítica originada por RECOVERY_TRIGGER.
-
-        Activa el modo recuperación: is_target_reached() bloqueará la lógica
-        normal y solo retornará True cuando el PnL NO REALIZADO de las
-        posiciones abiertas iguale o supere el monto perdido.
-
-        Args:
-            loss_usd: resultado neto del trade cerrado (debe ser negativo).
-        """
-        with self.lock:
-            if loss_usd >= 0:
-                return  # solo registramos pérdidas reales
-            self._pending_recovery_loss += loss_usd   # acumula (se vuelve más negativo)
-            self._recovery_mode = True
-            logger.warning(
-                f"🔴 [PTM] RECOVERY_TRIGGER registrado | "
-                f"Pérdida este trade: ${loss_usd:.4f} | "
-                f"Total a recuperar: ${abs(self._pending_recovery_loss):.4f}"
-            )
-
-    def _get_unrealized_gross(self) -> Optional[float]:
-        """
-        🆕 Retorna únicamente el PnL bruto no realizado total (float) o None.
-        Usa use_net_estimate para elegir la variante.
-        """
-        summary = self._get_unrealized_summary()
-        if not summary:
-            return None
-        if self.use_net_estimate:
-            val = summary.get('total_unrealized_net_est', summary.get('total_unrealized_gross'))
-        else:
-            val = summary.get('total_unrealized_gross')
-        try:
-            return float(val) if val is not None else None
-        except (TypeError, ValueError):
-            return None
-
     def is_target_reached(self) -> bool:
         """
-        Evalúa si se debe cerrar todo.
-
-        PRIORIDAD 1 – MODO RECUPERACIÓN (RECOVERY_TRIGGER):
-            Si hubo una pérdida crítica registrada via register_critical_loss(),
-            solo retorna True cuando el PnL NO REALIZADO de las posiciones abiertas
-            iguale o supere el monto perdido.  Mientras no se cumpla, retorna False
-            sin evaluar ninguna otra condición.
-
-        PRIORIDAD 2 – TARGET NORMAL:
-            1) Ganancia realizada (balance - daily_start_balance) >= target
-            2) (Opcional) Balance combinado (balance + unrealized_pnl) >= target
+        Evalúa si se alcanzó el target. Dos checks:
+         1) Ganancia realizada (balance - daily_start_balance) >= target
+         2) (Opcional) Balance combinado (balance + unrealized_pnl) >= (daily_start_balance + target)
         """
         with self.lock:
             try:
                 if not self.bot:
-                    logger.debug("ProfitTargetManager: bot no adjuntado.")
+                    logger.debug("ProfitTargetManager: bot no adjuntado, usando solo current_target check por balance.")
                     return False
 
-                # ============================================================
-                # 🆕 PRIORIDAD 1: RECOVERY MODE
-                # Cuando hay una pérdida crítica pendiente, IGNORAR la lógica
-                # de target normal y esperar a que el PnL no realizado la cubra.
-                # ============================================================
-                if self._recovery_mode and self._pending_recovery_loss < 0:
-                    loss_to_recover = abs(self._pending_recovery_loss)
-                    unrealized = self._get_unrealized_gross()
-
-                    if unrealized is None:
-                        # No se puede calcular todavía → esperar
-                        logger.debug(f"[PTM RECOVERY] Sin datos de PnL no realizado, esperando...")
-                        return False
-
-                    logger.info(
-                        f"🔴 [PTM RECOVERY] Pérdida a recuperar: ${loss_to_recover:.4f} | "
-                        f"PnL no realizado: ${unrealized:.4f}"
-                    )
-
-                    if unrealized >= loss_to_recover:
-                        # ✅ El PnL no realizado ya cubre la pérdida → CERRAR TODO
-                        logger.info(
-                            f"✅ [PTM RECOVERY] CONDICIÓN CUMPLIDA → "
-                            f"PnL no realizado ${unrealized:.4f} >= pérdida ${loss_to_recover:.4f} | "
-                            f"Señalizando cierre de todas las posiciones."
-                        )
-                        # Limpiar estado de recuperación para el próximo ciclo
-                        self._pending_recovery_loss = 0.0
-                        self._recovery_mode = False
-                        return True
-                    else:
-                        # ⏳ Todavía no alcanza → seguir esperando
-                        logger.info(
-                            f"⏳ [PTM RECOVERY] Necesito ${loss_to_recover:.4f}, "
-                            f"tengo ${unrealized:.4f} → ESPERANDO"
-                        )
-                        return False
-
-                # ============================================================
-                # PRIORIDAD 2: LÓGICA NORMAL DE TARGET
-                # ============================================================
+                # 1) Ganancia realizada
                 balance = float(getattr(self.bot, 'balance', 0.0))
                 daily_start = float(getattr(self.bot, 'daily_start_balance', 0.0))
                 realized_gain = balance - daily_start
                 target = float(self.current_target)
 
-                logger.debug(
-                    f"PTM: balance={balance:.2f}, daily_start={daily_start:.2f}, "
-                    f"realized_gain={realized_gain:.2f}, target={target:.2f}"
-                )
+                # Log de diagnóstico (muy útil al debuguear)
+                logger.debug(f"PTM: balance={balance:.2f}, daily_start={daily_start:.2f}, realized_gain={realized_gain:.2f}, target={target:.2f}")
 
-                # 1) Ganancia / pérdida realizada
-                if realized_gain >= target or realized_gain <= -0.5 * target:
-                    logger.info(
-                        f"PTM: Target alcanzado por ganancia realizada: "
-                        f"${realized_gain:.2f} >= ${target:.2f}"
-                    )
+                if realized_gain >= target or realized_gain <= -10.5*target:  # Considerar también pérdida extrema
+                    logger.info(f"PTM: Target alcanzado por ganancia realizada: ${realized_gain:.2f} >= ${target:.2f}")
+                    if realized_gain <= -10.5*target:
+                       if getattr(self.bot, 'inversion_posiciones_PROBABLE'):
+                                 
+                            setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Activar inversión por historial de pérdidas")
+                       else: 
+                            setattr(self.bot, 'inversion_posiciones_PROBABLE', True) 
+                            
+                    elif realized_gain >= target:
+                        logger.debug("ProfitTargetManager: bot  adjuntado, usando solo current_target check por balance.")                     
+                        
                     return True
 
-                # 2) Balance combinado (incluye PnL no realizado)
+                # 2) Considerar PnL no realizado -> balance combinado
                 if self.consider_unrealized:
                     summary = self._get_unrealized_summary()
                     if summary:
                         if self.use_net_estimate:
-                            combined = summary.get(
-                                'combined_balance_net_est',
-                                summary.get('combined_balance_gross')
-                            )
+                            combined = float(summary.get('combined_balance_net_est', summary.get('combined_balance_gross', None)))
                         else:
-                            combined = summary.get('combined_balance_gross')
+                            combined = float(summary.get('combined_balance_gross', None))
 
                         if combined is not None:
-                            try:
-                                combined = float(combined)
-                                combined_gain = combined - daily_start
-                                logger.debug(
-                                    f"PTM: combined_balance={combined:.2f}, "
-                                    f"combined_gain={combined_gain:.2f}"
-                                )
-                                if combined_gain >= target or combined_gain <= -0.5 * target:
-                                    logger.info(
-                                        f"PTM: Target alcanzado por balance combinado "
-                                        f"(incluye PnL no realizado): "
-                                        f"${combined_gain:.2f} >= ${target:.2f}"
-                                    )
-                                    return True
-                            except (TypeError, ValueError):
-                                pass
+                            combined_gain = combined - daily_start
+                            logger.debug(f"PTM: combined_balance={combined:.2f}, combined_gain={combined_gain:.2f}")
+                            if combined_gain >= target or combined_gain <= -10.5*target:  # Considerar también pérdida extrema
+                                logger.info(f"PTM: Target alcanzado por balance combinado (incluye PnL no realizado): ${combined_gain:.2f} >= ${target:.2f}")
+                                if combined_gain <= -10.5*target:
+                                    if getattr(self.bot, 'inversion_posiciones_PROBABLE'):
+                                        setattr(self.bot, 'inversion_posiciones_PROBABLE', False)  # Desactivar inversión por historial de pérdidas
+                                    else:
+                                        setattr(self.bot, 'inversion_posiciones_PROBABLE', True)  # Activar inversión por historial de pérdidas
+                                elif combined_gain >= target:
+                                    
+                                    logger.debug("ProfitTargetManager: bot adjuntado, usando solo current_target check por balance.")
+                                    
+                                return True
 
                 return False
 
@@ -730,6 +620,7 @@ class DataCache:
                 logger.info("✅ WebSocket de precios detenido")
             except Exception as e:
                 logger.error(f"Error deteniendo WebSocket: {e}")
+
 
 # ==================== GESTOR DE ESTADO MEJORADO ====================
 
@@ -1534,21 +1425,6 @@ class OrderExecutor:
             logger.info("💸 Entry fee: %.6f | Exit fee: %.6f | Total fees: %.6f", entry_fee, exit_fee, total_fees)
             logger.info("💰 RESULTADO NETO: %.6f", result)
 
-            # 🆕 HOOK RECOVERY_TRIGGER → notificar al ProfitTargetManager
-            # Si este cierre fue forzado por ROI crítico, registrar la pérdida para
-            # que is_target_reached() espere a recuperarla via PnL no realizado.
-            if 'RECOVERY_TRIGGER' in reason and result < 0:
-                try:
-                    ptm = getattr(self.bot, 'profit_target_manager', None)
-                    if ptm is not None and hasattr(ptm, 'register_critical_loss'):
-                        ptm.register_critical_loss(result)
-                        logger.info(
-                            "🔴 [_record_closed] Pérdida crítica (%.4f) reportada al ProfitTargetManager. "
-                            "Recovery mode ACTIVADO.", result
-                        )
-                except Exception:
-                    logger.debug("No se pudo registrar pérdida crítica en ProfitTargetManager (ignorado)")
-
             # Actualizar balance del bot (si tu bot maneja concurrencia, añade lock en bot)
             balance_before = getattr(self.bot, 'balance', 0.0)
             try:
@@ -1688,6 +1564,8 @@ class HeikinAshiTradingBot:
         self.completed_trades = []
         self.balance = 0
         self.inversion_posiciones = True
+        self.inversion_posiciones_PROBABLE = True
+        self.Bandera_de_Cierre_por_target = False
         
         # 🆕 NUEVO SISTEMA DE RACHA POR ROI
         self.racha_roi = {
@@ -1715,7 +1593,7 @@ class HeikinAshiTradingBot:
 
 
                 # 🎯 NUEVO: Sistema de Profit Targets
-        self.profit_target_manager = ProfitTargetManager(base_amount=4, wait_hours=0.1, bot=self, consider_unrealized=True, use_net_estimate=True)
+        self.profit_target_manager = ProfitTargetManager(base_amount=20, wait_hours=0.1, bot=self, consider_unrealized=True, use_net_estimate=True)
         self.in_cooldown = False
         self.cooldown_until = None
         self.cooldown_lock = threading.Lock()
@@ -2226,6 +2104,7 @@ class HeikinAshiTradingBot:
             logger.debug(f"Error en calculate_bollinger_bands para dataframe: {e}")
             return pd.Series(), pd.Series(), pd.Series()
 
+
     def add_indicators(self, df):
     
         df = df.copy()
@@ -2236,20 +2115,88 @@ class HeikinAshiTradingBot:
         # ── Williams %R ──────────────────────────────────────────
         df['williams_r'] = calculate_williams_r(df, period=300)
 
-        df['bb_middle'], df['bb_upper'], df['bb_lower'] = self.calculate_bollinger_bands(df, ema_period=70, std_dev=1.2)
+        df['bb_middle'], df['bb_upper'], df['bb_lower'] = self.calculate_bollinger_bands(df, ema_period=70, std_dev=0.5)
         # Version 'V' idéntica (sigues usando la misma configuración en el snippet)
-        df['bb_middleV'], df['bb_upperV'], df['bb_lowerV'] = self.calculate_bollinger_bands(df, ema_period=70, std_dev=1.2)
+        df['bb_middleV'], df['bb_upperV'], df['bb_lowerV'] = self.calculate_bollinger_bands(df, ema_period=70, std_dev=0.5)
         # Evitar división por cero más adelante: asegurar >0
         df['bb_middleV'] = df['bb_middleV'].replace(0, np.nan)
         df['bb_width'] = (df['bb_upperV'] - df['bb_lowerV']) / df['bb_middleV']
+        
+            # ── Momentum ─────────────────────────────────────────────────
+        df['momentum']     = calculate_momentum(df['close'], period=10)   # corto plazo
+        df['momentum_slow']= calculate_momentum(df['close'], period=70)   # alineado con tu EMA lenta
+
+        # Momentum normalizado (útil para comparar activos con precios distintos)
+        df['momentum_pct'] = df['close'].pct_change(14) * 100
+        
         df.dropna(inplace=True)
         return df
 
-    def check_long_entry(self, row):
-        return (row['open'] > row['ema_200'] and row['open'] > row['bb_lower'] and row['bb_width'] > 0.02312)
+    def check_long_entry(self, df: pd.DataFrame, idx: int = -2, symbol: str = "BTCUSDT") -> bool:
+        """
+        Señal LONG por breakout real hacia arriba de BB_upper.
+        Condiciones:
+          1. open actual > bb_upper  (rompe la banda superior)
+          2. open actual > ema_200   (a favor de la tendencia)
+          3. bb_width > umbral       (bandas con amplitud mínima)
+          4. Las BB_LOOKBACK_CANDLES velas anteriores estuvieron
+             DENTRO de las bandas  (bb_lower <= open <= bb_upper)
+             → confirma que fue un squeeze antes del breakout
+        """
+        try:
+            symbol = symbol.upper()
+            row = df.iloc[-1]
+            # Condiciones básicas de la vela actual
+            basic = (
+                row['open'] > row['bb_upper'] and   # breakout por arriba
+                row['open'] > row['ema_200'] and     # tendencia alcista
+                row['bb_width'] > 0.002312            # bandas con cuerpo suficiente
+            )
+            if not basic:
+                return False
+            # Verificar que las N velas previas estuvieron dentro de las bandas
+            n = BB_LOOKBACK_CANDLES
+            if abs(idx) + n > len(df):              # no hay suficiente historial
+                return False
+            prev_inside = all(
+                df.iloc[idx - i]['bb_lower'] <= df.iloc[idx - i]['open'] <= df.iloc[idx - i]['bb_upper']
+                for i in range(1, n + 1)
+            )
+            return prev_inside
+        except Exception:
+            return False
 
-    def check_short_entry(self, row):
-        return (row['open'] < row['ema_200'] and row['open'] < row['bb_upper'] and row['bb_width'] > 0.02312)
+    def check_short_entry(self, df: pd.DataFrame, idx: int = -2, symbol: str = "BTCUSDT") -> bool:
+        """
+        Señal SHORT por breakout real hacia abajo de BB_lower.
+        Condiciones:
+          1. open actual < bb_lower  (rompe la banda inferior)
+          2. open actual < ema_200   (a favor de la tendencia bajista)
+          3. bb_width > umbral       (bandas con amplitud mínima)
+          4. Las BB_LOOKBACK_CANDLES velas anteriores estuvieron
+             DENTRO de las bandas  (bb_lower <= open <= bb_upper)
+             → confirma squeeze antes del breakout
+        """
+        try:
+            symbol = symbol.upper()
+            row = df.iloc[-1]
+            basic = (
+                row['open'] < row['bb_lower'] and   # breakout por abajo
+                row['open'] < row['ema_200'] and     # tendencia bajista
+                row['bb_width'] > 0.002312
+            )
+            if not basic:
+                return False
+            n = BB_LOOKBACK_CANDLES
+            if abs(idx) + n > len(df):
+                return False
+            prev_inside = all(
+                df.iloc[idx - i]['bb_lower'] <= df.iloc[idx - i]['open'] <= df.iloc[idx - i]['bb_upper']
+                for i in range(1, n + 1)
+            )
+            return prev_inside
+        except Exception:
+            return False
 
     def check_long_exit(self, row):
         return row['open'] < row['bb_lower']
@@ -2407,25 +2354,44 @@ class HeikinAshiTradingBot:
             last_bar = df.iloc[-2]
             signal_type = None
 
-            if self.inversion_posiciones:
-                if self.check_short_entry(last_bar):
+            # if self.inversion_posiciones:
+            #     if self.check_short_entry(df, -2,symbol):
+            #         signal_type = "LONG"
+            #     elif self.check_long_entry(df, -2,symbol):
+            #         signal_type = "SHORT"
+            #     else:
+            #         return {}
+            # else:
+            if self.check_long_entry(df, -2,symbol): # and last_bar['open'] > last_bar['ema_20'] and last_bar['ema_20'] > last_bar['ema_70'] and last_bar['williams_r'] > -40:
                     signal_type = "LONG"
-                elif self.check_long_entry(last_bar):
+            elif self.check_short_entry(df, -2,symbol): # and last_bar['open'] < last_bar['ema_20'] and last_bar['ema_20'] < last_bar['ema_70'] and last_bar['williams_r'] < -60:
                     signal_type = "SHORT"
-                else:
-                    return {}
             else:
-                if self.check_long_entry(last_bar): # and last_bar['open'] > last_bar['ema_20'] and last_bar['ema_20'] > last_bar['ema_70'] and last_bar['williams_r'] > -40:
-                    signal_type = "LONG"
-                elif self.check_short_entry(last_bar): # and last_bar['open'] < last_bar['ema_20'] and last_bar['ema_20'] < last_bar['ema_70'] and last_bar['williams_r'] < -60:
-                    signal_type = "SHORT"
-                else:
-                    return {}
+                    return {}                
+            
+            # -------------- Nuevo check: historial de pérdidas por símbolo --------------
+            # try:
+            #     if signal_type and self._should_invert_signal_for_symbol(symbol, signal_type):
+            #         # invertir señal
+            #         original_signal = signal_type
+            #         signal_type = "LONG" if signal_type == "SHORT" else "SHORT"
+            #         logger.warning(f"🔄 Señal invertida para {symbol}: {original_signal} -> {signal_type} (por historial de pérdidas)")
+            # except Exception as e:
+            #     logger.debug(f"Error aplicando inversión por historial para {symbol}: {e}")
+            # ---------------------------------------------------------------------------
+            
+            if signal_type == "LONG" and self.inversion_posiciones_PROBABLE:
+                signal_type = "SHORT"
+            elif signal_type == "SHORT" and self.inversion_posiciones_PROBABLE:
+                signal_type = "LONG"
+                
+            # ---------------------------------------------------------------------------
+                
             # Precio actual preferente desde WebSocket/cache
             current_price = self.data_cache.get_current_price(symbol)
             if current_price is None:
                 current_price = float(last_bar['close'])
-
+                
             # TP/SL inicial: simple y coherente con las bandas
             if signal_type == "LONG":
                 # initial_tp = float(last_bar['bb_upper'])
@@ -2437,17 +2403,6 @@ class HeikinAshiTradingBot:
                 # initial_sl = float(last_bar['bb_upper'])
                 initial_tp = current_price/((ROI_CRITICAL_PROFIT/100)+1)
                 initial_sl = current_price/((ROI_CRITICAL_LOSS/100)+1)
-
-            # -------------- Nuevo check: historial de pérdidas por símbolo --------------
-            try:
-                if signal_type and self._should_invert_signal_for_symbol(symbol, signal_type):
-                    # invertir señal
-                    original_signal = signal_type
-                    signal_type = "LONG" if signal_type == "SHORT" else "SHORT"
-                    logger.warning(f"🔄 Señal invertida para {symbol}: {original_signal} -> {signal_type} (por historial de pérdidas)")
-            except Exception as e:
-                logger.debug(f"Error aplicando inversión por historial para {symbol}: {e}")
-            # ---------------------------------------------------------------------------
 
             return {
                 'symbol': symbol,
@@ -2469,7 +2424,8 @@ class HeikinAshiTradingBot:
         except Exception as e:
             logger.debug(f"Error analizando (EMA+BB) para {symbol}: {e}")
             return {}
-
+        
+        
 # ---------------- Helper: decidir si invertir señal por historial ----------------
     def _should_invert_signal_for_symbol(self, symbol: str, signal_type: str,
                                         recent_n: int = LOSS_HISTORY_LEN,
@@ -2897,6 +2853,185 @@ class HeikinAshiTradingBot:
             return False
 
 
+
+    def check_and_execute_inverse_pyramiding(self, symbol: str):
+        """
+        Pyramiding inverso:
+        - Solo actúa si INVERSE_PYRAMIDING_ENABLED y self.inversion_posiciones_PROBABLE True
+        - Si una posición está en pérdida (ROI negativo) y alcanza uno de los niveles negativos,
+        abre una orden adicional para intentar recuperar (en la dirección opuesta si procede).
+        - Respeta INVERSE_PYRAMIDING_MAX_ADDS; si el trade ya tiene >= INVERSE_PYRAMIDING_ABORT_LEVEL
+        niveles, fuerza aceptar pérdida y cerrar.
+        """
+        try:
+            if not INVERSE_PYRAMIDING_ENABLED:
+                return
+            # Solo cuando el bot indicó inversión por historial (tu flag)
+            if not getattr(self, 'inversion_posiciones_PROBABLE', False):
+                return
+
+            trade = self.state_manager.get_trade(symbol)
+            if not trade:
+                return
+
+            # Si el trade no permite pyramiding en modo normal Y no estamos en modo inverso activado -> salir.
+            # Pero si INVERSE_PYRAMIDING está activado y self.inversion_posiciones_PROBABLE True, permitimos ejecutar.
+            if not getattr(trade, 'pyramiding_enabled', True) and not (
+                INVERSE_PYRAMIDING_ENABLED and getattr(self, 'inversion_posiciones_PROBABLE', False)
+            ):
+                return
+
+            # Obtener precio y ROI actual
+            current_price = self.data_cache.get_current_price(symbol)
+            if not current_price:
+                return
+
+            current_roi = self.calculate_position_roi(trade, current_price)
+            # Asegurar ROI negativo significativo
+            if current_roi is None or current_roi > INVERSE_PYRAMIDING_MINIMUM_ROI_TO_TRIGGER:
+                return
+
+            # Contador total de niveles ya aplicados (incluye pyramid_levels actuales)
+            total_levels = len(getattr(trade, 'pyramid_levels', []))
+
+            # Si ya llegamos al abort level -> aceptar pérdida y cerrar
+            if total_levels >= INVERSE_PYRAMIDING_ABORT_LEVEL:
+                logger.warning(f"PYR_INV: niveles ({total_levels}) >= abort_level ({INVERSE_PYRAMIDING_ABORT_LEVEL}) para {symbol}. Aceptando pérdida.")
+                self._force_accept_loss_and_close(symbol, reason=f"inverse_pyramid_abort_levels_{total_levels}")
+                return
+
+            # Cuántos adds hemos hecho ya (no más de INVERSE_PYRAMIDING_MAX_ADDS)
+            adds_done = total_levels
+            if adds_done >= INVERSE_PYRAMIDING_MAX_ADDS:
+                logger.info(f"PYR_INV: ya se hicieron {adds_done} adds (max={INVERSE_PYRAMIDING_MAX_ADDS}) para {symbol}. No abrir más.")
+                return
+
+            # Buscar el siguiente nivel negativo no usado
+            # Normalizamos niveles a positivo para uso en sets (ej: -1.0 -> 1.0)
+            completed_neg_levels = getattr(trade, 'completed_inverse_pyramid_levels', set())
+            for neg_level in INVERSE_PYRAMIDING_NEG_ROI_LEVELS:
+                if abs(neg_level) in completed_neg_levels:
+                    continue
+                # Si ROI actual es menor o igual a este umbral (más negativo)
+                if current_roi <= neg_level:
+                    logger.info(f"🔥 PYRAMIDING INVERSO activado para {symbol} en ROI {current_roi:.2f}% (umbral {neg_level}%)")
+                    
+                    # Determinar side: para intentar recuperar abrimos en sentido contrario
+                    # Si trade original era LONG y está en pérdida, abrimos SHORT para recuperar y viceversa.
+                    if trade.trade_type == "LONG":
+                        pyr_side = "SELL"
+                        new_trade_type = "SHORT"
+                    else:
+                        pyr_side = "BUY"
+                        new_trade_type = "LONG"
+
+                    # calcular cantidad a añadir:
+                    
+                    # calcular cantidad a añadir (con aceleración a partir de cierto nivel)
+                    # level_actual será el siguiente nivel que vamos a añadir (1-based)
+                    next_level_index = len(getattr(trade, 'pyramid_levels', [])) + 1
+
+                    # cantidad base (lo que ya tenías)
+                    base_quantity = float(trade.original_quantity or getattr(trade, 'quantity', 0.0)) * float(INVERSE_PYRAMIDING_MULTIPLIER or 1.0)
+
+                    # Si el siguiente nivel está en o después del nivel de aceleración, aplicamos factor (x3, x3^2, ...)
+                    if next_level_index >= INVERSE_PYRAMIDING_ACCELERATION_START_LEVEL:
+                        # cuántos niveles desde el inicio de aceleración (1 -> primer nivel acelerado)
+                        levels_since = next_level_index - INVERSE_PYRAMIDING_ACCELERATION_START_LEVEL + 1
+                        accel_mult = float(INVERSE_PYRAMIDING_ACCELERATION_MULTIPLIER) ** max(1, int(levels_since))
+                        # limitar el multiplicador para evitar tamaños descontrolados
+                        accel_mult = min(float(INVERSE_PYRAMIDING_ACCELERATION_MAX_MULT), accel_mult)
+                        new_quantity = base_quantity * accel_mult
+                    else:
+                        new_quantity = base_quantity
+
+                    # seguridad: no permitir qty <= 0
+                    if new_quantity <= 0:
+                        logger.warning(f"PYR_INV: cantidad inválida {new_quantity} para {symbol}")
+                        return
+                    
+                    if new_quantity <= 0:
+                        logger.warning(f"PYR_INV: cantidad inválida {new_quantity} para {symbol}")
+                        return
+
+                    # calcular TP/SL conservadores para recuperar (puedes ajustar porcentajes)
+                    if new_trade_type == "LONG":
+                        tp = current_price * 1.02   # +2% objetivo rápido
+                        sl = current_price * 0.99   # -1% stop
+                    else:
+                        tp = current_price * 0.98   # -2% objetivo para SHORT
+                        sl = current_price * 1.01   # +1% stop
+
+                    # crear comando y enviarlo a executor (usa misma estructura que execute_pyramiding_level)
+                    cmd = OrderCommandData(
+                        command="OPEN_POSITION",
+                        symbol=symbol,
+                        data={
+                            'side': pyr_side,
+                            'quantity': new_quantity,
+                            'tp': tp,
+                            'sl': sl,
+                            'is_inverse_pyramiding': True,
+                            'inverse_pyramiding_level': neg_level,
+                            'leverage': getattr(self, '_max_leverage_for_symbol', lambda s: None)(symbol)
+                        },
+                        trade_id=trade.trade_id
+                    )
+                    self.order_executor.submit_command(cmd)
+
+                    # registrar meta en trade (para no re-ejecutar el mismo nivel)
+                    try:
+                        if not hasattr(trade, 'completed_inverse_pyramid_levels'):
+                            trade.completed_inverse_pyramid_levels = set()
+                        trade.completed_inverse_pyramid_levels.add(abs(neg_level))
+                        # añadir pyramid_level para contabilizar total_levels y avg
+                        trade.pyramid_symbol_enabled = True  # Marcar que este trade tiene pyramiding activo (aunque sea inverso)
+                        pyramid_level = PyramidLevel(
+                            level=len(trade.pyramid_levels) + 1,
+                            roi_threshold=neg_level,
+                            entry_price=current_price,
+                            quantity=new_quantity,
+                            entry_time=datetime.now()
+                        )
+                        trade.pyramid_levels.append(pyramid_level)
+                        # actualizar weighted_avg_price / total_quantity (reusa tu helper)
+                        self.update_weighted_avg_price(trade, current_price, new_quantity)
+                        logger.info(f"PYR_INV: nivel agregado para {symbol} -> qty={new_quantity} tp={tp} sl={sl}")
+                    except Exception as e:
+                        logger.debug(f"PYR_INV: fallo al actualizar trade {symbol}: {e}")
+
+                    # Salimos tras ejecutar un nivel (evita múltiples en la misma iteración)
+                    return
+
+        except Exception as e:
+            logger.exception(f"PYR_INV: excepción en check_and_execute_inverse_pyramiding para {symbol}: {e}")
+
+
+
+    def _force_accept_loss_and_close(self, symbol: str, reason: str = "inverse_pyramid_force_accept"):
+        """
+        Fuerza aceptar la perdida: envía CLOSE_POSITION y registra reason.
+        """
+        try:
+            trade = self.state_manager.get_trade(symbol)
+            if not trade:
+                logger.warning(f"force_accept_loss: trade no existe para {symbol}")
+                return
+
+            # Crear comando de cierre (usa trade_id para evitar dobles)
+            cmd = OrderCommandData(
+                command="CLOSE_POSITION",
+                symbol=symbol,
+                data={'reason': reason},
+                trade_id=trade.trade_id
+            )
+            self.order_executor.submit_command(cmd)
+            logger.warning(f"force_accept_loss: enviado CLOSE para {symbol} por {reason}")
+        except Exception as e:
+            logger.exception(f"force_accept_loss: error cerrando {symbol}: {e}")
+
+
+
     # ==================== FIN FUNCIONES DE PYRAMIDING ====================
 
     def _is_touching_ema(self, price: float, ema200: float, tol: float = EMATOUCH_TOLERANCE) -> bool:
@@ -3067,6 +3202,9 @@ class HeikinAshiTradingBot:
             # Última vela cerrada
             last_bar = ha_df.iloc[-2]
             last_barLOP = df_LOP.iloc[-2]
+            
+            # 🆕 Vela anterior (para detectar cruce de momentum)
+            prev_barLOP = df_LOP.iloc[-3] if len(df_LOP) >= 3 else last_barLOP            
             current_bar = ha_df.iloc[-1]
             
             # Actualizar contador de velas
@@ -3096,6 +3234,11 @@ class HeikinAshiTradingBot:
 
             # 🔥 PYRAMIDING
             self.check_and_execute_pyramiding(symbol)
+            
+            try:
+                    self.check_and_execute_inverse_pyramiding(symbol)
+            except Exception as e:
+                    logger.debug(f"Error ejecutando inverse pyramiding para {symbol}: {e}")
 
 
 
@@ -3108,22 +3251,42 @@ class HeikinAshiTradingBot:
                     threshold = getattr(trade, 'pyramiding_close_roi', None)
                     if threshold is None:
                         threshold = PYRAMIDING_CLOSE_ROI
+                        
+                    if not self.inversion_posiciones_PROBABLE:
 
-                    # evaluar cierre
-                    if current_roi is not None and current_roi <= float(threshold):
-                        exit_signal = {
-                            'symbol': symbol,
-                            'exit_price': current_price,
-                            'exit_reason': f'PYRAMID_CLOSE_ROI (ROI={current_roi:.2f}% >= {threshold}%)',
-                            'timestamp': datetime.now()
-                        }
-                        try:
-                            self.exit_queue.put_nowait(exit_signal)
-                            logger.info(f"📤 PYR CIERRE POR ROI enviado: {symbol} | ROI={current_roi:.2f}% >= {threshold}%")
-                        except Full:
-                            logger.warning(f"Cola de salidas llena al intentar cerrar por pyramiding ROI: {symbol}")
-                        # retornamos para no seguir con más lógica en este ciclo (evita dobles señales)
-                        return
+                        # evaluar cierre
+                        if current_roi is not None and current_roi <= float(threshold):
+                            exit_signal = {
+                                'symbol': symbol,
+                                'exit_price': current_price,
+                                'exit_reason': f'PYRAMID_CLOSE_ROI (ROI={current_roi:.2f}% >= {threshold}%)',
+                                'timestamp': datetime.now()
+                            }
+                            try:
+                                self.exit_queue.put_nowait(exit_signal)
+                                logger.info(f"📤 PYR CIERRE POR ROI enviado: {symbol} | ROI={current_roi:.2f}% >= {threshold}%")
+                            except Full:
+                                logger.warning(f"Cola de salidas llena al intentar cerrar por pyramiding ROI: {symbol}")
+                            # retornamos para no seguir con más lógica en este ciclo (evita dobles señales)
+                            return
+                        
+                    if self.inversion_posiciones_PROBABLE:
+                        if current_roi is not None and current_roi >= float(threshold):
+                            exit_signal = {
+                                'symbol': symbol,
+                                'exit_price': current_price,
+                                'exit_reason': f'PYRAMID_CLOSE_ROI (ROI={current_roi:.2f}% <= {threshold}%)',
+                                'timestamp': datetime.now()
+                            }
+                            try:
+                                self.exit_queue.put_nowait(exit_signal)
+                                logger.info(f"📤 PYR CIERRE POR ROI enviado: {symbol} | ROI={current_roi:.2f}% <= {threshold}%")
+                            except Full:
+                                logger.warning(f"Cola de salidas llena al intentar cerrar por pyramiding ROI: {symbol}")
+                            return
+                    
+                    
+                    
             except Exception as e:
                 logger.debug(f"Error en cierre por ROI (pyramiding) para {symbol}: {e}")
             # ---------------------------------------------------------------
@@ -3247,7 +3410,7 @@ class HeikinAshiTradingBot:
                 # ==============================================================================
                 # Si el manager dice que llegamos a la meta, cerramos ESTA posición individualmente.
                 # El manager maneja el cálculo global, aquí solo ejecutamos la salida.
-                if self.profit_target_manager.is_target_reached():
+                if self.profit_target_manager.is_target_reached() or self.Bandera_de_Cierre_por_target:
                     
                     # Definir razón específica
                     target_val = self.profit_target_manager.get_current_target()
@@ -3270,13 +3433,60 @@ class HeikinAshiTradingBot:
                     
                     return
 
-                if not self.inversion_posiciones:
+                # ==============================================================================
+                # 🆕 5. CIERRE POR MOMENTUM ADVERSO CON ROI NEGATIVO
+                # ==============================================================================
+                
+                if trade.trade_type == "LONG" and self.inversion_posiciones_PROBABLE:
+                    signal_type = "SHORT"
+                    current_roi = (-current_roi)
+                elif trade.trade_type == "SHORT" and self.inversion_posiciones_PROBABLE:
+                    signal_type = "LONG"
+                    current_roi = (-current_roi)
+                
+                if MOMENTUM_EXIT_ENABLED and current_roi is not None and current_roi < MOMENTUM_EXIT_ROI_MAX:
+
+                    momentum_exit_signal = None
+
+                    if signal_type == "LONG":
+                        if check_bearish_momentum(self, last_barLOP, prev_barLOP):
+                            momentum_exit_signal = {
+                                'symbol': symbol,
+                                'exit_price': current_price,
+                                'exit_reason': f'MOMENTUM_BEARISH_EXIT | LONG en pérdida (ROI: {current_roi:.2f}%)',
+                                'timestamp': datetime.now()
+                            }
+                            logger.warning(f"📉 Momentum BEARISH en LONG perdedor: {symbol} | ROI: {current_roi:.2f}%")
+
+                    else:  # SHORT
+                        if check_bullish_momentum(self,last_barLOP, prev_barLOP):
+                            momentum_exit_signal = {
+                                'symbol': symbol,
+                                'exit_price': current_price,
+                                'exit_reason': f'MOMENTUM_BULLISH_EXIT | SHORT en pérdida (ROI: {current_roi:.2f}%)',
+                                'timestamp': datetime.now()
+                            }
+                            logger.warning(f"📈 Momentum BULLISH en SHORT perdedor: {symbol} | ROI: {current_roi:.2f}%")
+
+                    if momentum_exit_signal:
+                        try:
+                            self.exit_queue.put_nowait(momentum_exit_signal)
+                            logger.info(f"📤 Cierre por Momentum: {symbol} → {momentum_exit_signal['exit_reason']}")
+                        except Full:
+                            logger.warning(f"Cola de salidas llena (momentum exit): {symbol}")
+                        return
+
+                # ==============================================================================
+                # 6. MODO NORMAL: Condiciones de cierre estándar (tu código existente)
+                # ==============================================================================
+
+                if not self.inversion_posiciones_PROBABLE:
                 # MODO NORMAL: Condiciones de cierre estándar
-                    if trade.trade_type == "LONG":
-                        if self.check_long_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (-ROI_CRITICAL_LOSS):
+                    if signal_type == "LONG":
+                        if self.check_long_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (ROI_CRITICAL_PROFIT):
                             
                             # 🆕 VERIFICAR ROI antes de cerrar
-                            if current_roi > (-ROI_CRITICAL_LOSS):
+                            if self.check_long_exit(last_barLOP)  and not self.inversion_posiciones:
                                 logger.info(f"⏸️ Señal de cierre detectada pero ROI muy bajo: {current_roi:.2f}%")
                                 logger.info(f"   Esperando recuperación...")
                                 exit_signal = {
@@ -3286,7 +3496,7 @@ class HeikinAshiTradingBot:
                                     'timestamp': datetime.now()
                                 }
                                 # NO cerrar, continuar esperando
-                            elif current_roi < ROI_CRITICAL_LOSS:
+                            elif current_roi < ROI_CRITICAL_LOSS or current_roi > ROI_CRITICAL_PROFIT:
                                 exit_signal = {
                                     'symbol': symbol,
                                     'exit_price': current_price,
@@ -3295,9 +3505,9 @@ class HeikinAshiTradingBot:
                                 }
                     
                     else:  # SHORT
-                        if self.check_short_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (-ROI_CRITICAL_LOSS):
+                        if self.check_short_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (ROI_CRITICAL_PROFIT):
                             
-                            if current_roi > (-ROI_CRITICAL_LOSS):
+                            if self.check_short_exit(last_barLOP)  and not self.inversion_posiciones:
                                 
                                 logger.info(f"⏸️ Señal de cierre detectada pero ROI muy bajo: {current_roi:.2f}%")
                                 logger.info(f"   Esperando recuperación...")
@@ -3308,7 +3518,7 @@ class HeikinAshiTradingBot:
                                     'timestamp': datetime.now()
                                 }
 
-                            elif current_roi < ROI_CRITICAL_LOSS:
+                            elif current_roi < ROI_CRITICAL_LOSS or current_roi > ROI_CRITICAL_PROFIT:
                                 exit_signal = {
                                     'symbol': symbol,
                                     'exit_price': current_price,
@@ -3317,11 +3527,11 @@ class HeikinAshiTradingBot:
                                 }
                 
                 else:
-                    if trade.trade_type == "SHORT":
-                        if self.check_long_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (-ROI_CRITICAL_LOSS):
+                    if signal_type == "SHORT":
+                        if self.check_long_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (ROI_CRITICAL_PROFIT):
                             
                             # 🆕 VERIFICAR ROI antes de cerrar
-                            if current_roi > (-ROI_CRITICAL_LOSS):
+                            if self.check_short_exit(last_barLOP) and self.inversion_posiciones:
                                 logger.info(f"⏸️ Señal de cierre detectada pero ROI muy bajo: {current_roi:.2f}%")
                                 logger.info(f"   Esperando recuperación...")
                                 exit_signal = {
@@ -3332,7 +3542,7 @@ class HeikinAshiTradingBot:
                                 }
                                 
                                 # NO cerrar, continuar esperando
-                            elif current_roi < ROI_CRITICAL_LOSS:
+                            elif current_roi < ROI_CRITICAL_LOSS or current_roi > ROI_CRITICAL_PROFIT:
                                 exit_signal = {
                                     'symbol': symbol,
                                     'exit_price': current_price,
@@ -3341,9 +3551,9 @@ class HeikinAshiTradingBot:
                                 }
                     
                     else:  # LONG
-                        if self.check_short_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS :
+                        if self.check_short_exit(last_barLOP) or current_roi < ROI_CRITICAL_LOSS or current_roi > (ROI_CRITICAL_PROFIT):
                             
-                            if current_roi > (-ROI_CRITICAL_LOSS):
+                            if self.check_long_exit(last_barLOP) and self.inversion_posiciones:
                                 logger.info(f"⏸️ Señal de cierre detectada pero ROI muy bajo: {current_roi:.2f}%")
                                 logger.info(f"   Esperando recuperación...")
                                 exit_signal = {
@@ -3353,7 +3563,7 @@ class HeikinAshiTradingBot:
                                     'timestamp': datetime.now()
                                 }
 
-                            elif current_roi < ROI_CRITICAL_LOSS:
+                            elif current_roi < ROI_CRITICAL_LOSS or current_roi > ROI_CRITICAL_PROFIT:
                                 exit_signal = {
                                     'symbol': symbol,
                                     'exit_price': current_price,
@@ -3454,6 +3664,7 @@ class HeikinAshiTradingBot:
             
         except Exception as e:
             logger.debug(f"Error en check_exit_and_update para {symbol}: {e}")
+
 
 
 
@@ -4561,6 +4772,7 @@ class HeikinAshiTradingBot:
                                 break
                                 
                             logger.info(f"⏳ Esperando que 'check_exit_and_update' cierre {active_count} posiciones...")
+                            self.Bandera_de_Cierre_por_target = True
                             time.sleep(2)
 
                         # C. ACTUALIZAR ESTADO DEL BOT (Administrativo)
@@ -4577,6 +4789,7 @@ class HeikinAshiTradingBot:
                         self.set_cooldown(hours=self.profit_target_manager.wait_hours)
                         
                         logger.warning("✅ CICLO COMPLETADO - Bot entra en reposo.")
+                        self.Bandera_de_Cierre_por_target = False
                         
                         time.sleep(5)
                         continue
